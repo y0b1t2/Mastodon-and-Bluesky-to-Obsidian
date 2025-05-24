@@ -1,0 +1,842 @@
+name: Mstdn and Bsky to Obsidian Sync
+
+on:
+  schedule:
+    # 毎日3:00 JST (18:00 UTC)に実行
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_full_sync:
+        description: 'Force full sync (all data)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'false'
+        - 'true'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  sync-all-social-media:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+        
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install requests python-dateutil
+        
+    - name: Create Thino directory
+      run: |
+        mkdir -p Thino
+        
+    - name: Run unified sync
+      env:
+        # Mastodon設定
+        MASTODON_ACCESS_TOKEN: ${{ secrets.MASTODON_ACCESS_TOKEN }}
+        MASTODON_INSTANCE_URL: ${{ secrets.MASTODON_INSTANCE_URL }}
+        # Bluesky設定
+        BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+        BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
+        # 共通設定
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        FORCE_FULL_SYNC: ${{ github.event.inputs.force_full_sync || 'false' }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+      run: |
+        python3 << 'EOF'
+        import requests
+        import json
+        import os
+        import re
+        import time
+        import logging
+        from datetime import datetime, timedelta, timezone
+        from html import unescape
+        from dateutil import parser
+        
+        # ロギング設定
+        logging.basicConfig(
+            level=logging.INFO, 
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        
+        # 日本時間のタイムゾーン
+        JST = timezone(timedelta(hours=9))
+        
+        # 環境変数の読み込み
+        MASTODON_ACCESS_TOKEN = os.getenv('MASTODON_ACCESS_TOKEN')
+        MASTODON_INSTANCE_URL = os.getenv('MASTODON_INSTANCE_URL')
+        BLUESKY_HANDLE = os.getenv('BLUESKY_HANDLE')
+        BLUESKY_PASSWORD = os.getenv('BLUESKY_PASSWORD')
+        GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
+        FORCE_FULL_SYNC = os.getenv('FORCE_FULL_SYNC') == 'true'
+        GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
+        
+        # 統一状態ファイル
+        UNIFIED_STATE_FILE = 'Thino/.unified-sync-state.json'
+        
+        
+        class UnifiedSyncState:
+            """統一された同期状態管理"""
+            def __init__(self):
+                self.state = self.load()
+                
+            def load(self):
+                """状態ファイルを読み込む"""
+                if os.path.exists(UNIFIED_STATE_FILE):
+                    try:
+                        with open(UNIFIED_STATE_FILE, 'r') as f:
+                            return json.load(f)
+                    except:
+                        pass
+                
+                # 初期状態
+                return {
+                    'mastodon': {
+                        'last_post_id': None,
+                        'last_execution_time': None
+                    },
+                    'bluesky': {
+                        'last_execution_time': None
+                    },
+                    'is_first_run': True
+                }
+            
+            def save(self):
+                """状態ファイルを保存"""
+                self.state['last_updated'] = datetime.now(JST).isoformat()
+                os.makedirs(os.path.dirname(UNIFIED_STATE_FILE), exist_ok=True)
+                with open(UNIFIED_STATE_FILE, 'w') as f:
+                    json.dump(self.state, f, indent=2, ensure_ascii=False)
+                logging.info(f"統一状態ファイルを保存: {UNIFIED_STATE_FILE}")
+        
+        
+        class MastodonSync:
+            """Mastodon同期処理"""
+            def __init__(self, instance_url, access_token, state):
+                self.instance_url = instance_url.rstrip('/')
+                self.headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                }
+                self.state = state
+                # 時刻フィルタ設定
+                is_manual = GITHUB_EVENT_NAME == 'workflow_dispatch'
+                self.hours_to_fetch = 48 if is_manual else 25
+                self.cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.hours_to_fetch)
+                
+            def get_account_id(self):
+                """アカウントIDを取得"""
+                try:
+                    response = requests.get(
+                        f"{self.instance_url}/api/v1/accounts/verify_credentials",
+                        headers=self.headers,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    return response.json()['id']
+                except Exception as e:
+                    logging.error(f"Mastodonアカウント情報取得エラー: {e}")
+                    return None
+                    
+            def fetch_posts(self, account_id):
+                """自分の投稿を取得（差分対応）"""
+                logging.info("Mastodon投稿を取得中...")
+                posts = []
+                
+                try:
+                    if self.state.state['is_first_run'] or FORCE_FULL_SYNC:
+                        # 全件取得
+                        logging.info("  初回実行または強制フル同期 - 全件取得")
+                        max_id = None
+                        while True:
+                            params = {'limit': 40}
+                            if max_id:
+                                params['max_id'] = max_id
+                            
+                            response = requests.get(
+                                f"{self.instance_url}/api/v1/accounts/{account_id}/statuses",
+                                headers=self.headers,
+                                params=params,
+                                timeout=30
+                            )
+                            response.raise_for_status()
+                            data = response.json()
+                            
+                            if not data:
+                                break
+                                
+                            posts.extend(data)
+                            max_id = data[-1]['id']
+                            time.sleep(1)  # レート制限対策
+                    else:
+                        # 差分取得
+                        last_id = self.state.state['mastodon'].get('last_post_id')
+                        if last_id:
+                            logging.info(f"  差分取得 - since_id: {last_id}")
+                            params = {'limit': 40, 'since_id': last_id}
+                            response = requests.get(
+                                f"{self.instance_url}/api/v1/accounts/{account_id}/statuses",
+                                headers=self.headers,
+                                params=params,
+                                timeout=30
+                            )
+                            response.raise_for_status()
+                            posts = response.json()
+                    
+                    logging.info(f"✅ Mastodon投稿取得完了: {len(posts)}件")
+                    return posts
+                    
+                except Exception as e:
+                    logging.error(f"Mastodon投稿取得エラー: {e}")
+                    return []
+                    
+            def fetch_favourites(self):
+                """お気に入りを取得（時刻フィルタリング）"""
+                logging.info(f"Mastodonお気に入り取得開始（{self.hours_to_fetch}時間以内）")
+                
+                try:
+                    response = requests.get(
+                        f"{self.instance_url}/api/v1/favourites",
+                        headers=self.headers,
+                        params={'limit': 40},
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if not data:
+                        logging.info("お気に入りが見つかりませんでした")
+                        return []
+                    
+                    # 時刻でフィルタリング
+                    recent_items = []
+                    for item in data:
+                        created_at = datetime.fromisoformat(
+                            item['created_at'].replace('Z', '+00:00')
+                        )
+                        if created_at > self.cutoff_time:
+                            recent_items.append(item)
+                    
+                    logging.info(f"✅ お気に入り取得完了: {len(recent_items)}/{len(data)}件が対象")
+                    return recent_items
+                    
+                except Exception as e:
+                    logging.error(f"Mastodonお気に入り取得エラー: {e}")
+                    return []
+                    
+            def fetch_bookmarks(self):
+                """ブックマークを取得（時刻フィルタリング）"""
+                logging.info(f"Mastodonブックマーク取得開始（{self.hours_to_fetch}時間以内）")
+                
+                try:
+                    response = requests.get(
+                        f"{self.instance_url}/api/v1/bookmarks",
+                        headers=self.headers,
+                        params={'limit': 40},
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if not data:
+                        logging.info("ブックマークが見つかりませんでした")
+                        return []
+                    
+                    # 時刻でフィルタリング
+                    recent_items = []
+                    for item in data:
+                        created_at = datetime.fromisoformat(
+                            item['created_at'].replace('Z', '+00:00')
+                        )
+                        if created_at > self.cutoff_time:
+                            recent_items.append(item)
+                    
+                    logging.info(f"✅ ブックマーク取得完了: {len(recent_items)}/{len(data)}件が対象")
+                    return recent_items
+                    
+                except Exception as e:
+                    logging.error(f"Mastodonブックマーク取得エラー: {e}")
+                    return []
+                    
+            def clean_html(self, html_content):
+                """HTMLタグを除去"""
+                if not html_content:
+                    return ""
+                
+                text = unescape(html_content)
+                
+                # Mastodonハッシュタグの処理
+                text = re.sub(r'<a[^>]*class="[^"]*hashtag[^"]*"[^>]*>#<span>([^<]*)</span></a>', r'#\1', text)
+                # 通常のリンク
+                text = re.sub(r'<a href="([^"]*)"[^>]*>([^<]*)</a>', r'[\2](\1)', text)
+                # HTMLタグを除去
+                text = re.sub(r'<p>', '', text)
+                text = re.sub(r'</p>', ' ', text)
+                text = re.sub(r'<br\s*/?>', ' ', text)
+                text = re.sub(r'<[^>]+>', '', text)
+                # 余分なスペースを整理
+                text = re.sub(r'\s+', ' ', text)
+                
+                return text.strip()
+                
+            def format_entry(self, item, entry_type):
+                """エントリーをThino形式に変換"""
+                post_time_utc = datetime.fromisoformat(
+                    item['created_at'].replace('Z', '+00:00')
+                )
+                post_time_jst = post_time_utc.astimezone(JST)
+                time_str = post_time_jst.strftime('%H:%M')
+                
+                if entry_type == 'post':
+                    content = self.clean_html(item['content'])
+                    return {
+                        'entry': f"- {time_str} {content} #via_mastodon",
+                        'date': post_time_jst.date(),
+                        'time': post_time_jst
+                    }
+                elif entry_type == 'favourite':
+                    content = self.clean_html(item['content'])
+                    account = item['account']
+                    author_name = account['display_name'] or account['username']
+                    return {
+                        'entry': f"- {time_str} ⭐️{author_name} {content} #via_mastodon_fav",
+                        'date': post_time_jst.date(),
+                        'time': post_time_jst
+                    }
+                elif entry_type == 'bookmark':
+                    content = self.clean_html(item['content'])
+                    account = item['account']
+                    author_name = account['display_name'] or account['username']
+                    return {
+                        'entry': f"- {time_str} 🔖{author_name} {content} #via_mastodon_bookmark",
+                        'date': post_time_jst.date(),
+                        'time': post_time_jst
+                    }
+        
+        
+        class BlueskySync:
+            """Bluesky同期処理（requests使用）"""
+            def __init__(self, handle, password, state):
+                self.handle = handle
+                self.password = password
+                self.state = state
+                self.session = None
+                self.did = None
+                self.base_url = 'https://bsky.social'
+                
+            def login(self):
+                """Blueskyにログイン"""
+                try:
+                    # セッション作成
+                    login_data = {
+                        'identifier': self.handle,
+                        'password': self.password
+                    }
+                    
+                    response = requests.post(
+                        f'{self.base_url}/xrpc/com.atproto.server.createSession',
+                        json=login_data,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        self.session = data.get('accessJwt')
+                        self.did = data.get('did')
+                        logging.info("✅ Blueskyログイン成功")
+                        logging.info(f"  DID: {self.did}")
+                        return True
+                    else:
+                        logging.error(f"Blueskyログイン失敗: {response.status_code}")
+                        logging.error(f"レスポンス: {response.text}")
+                        return False
+                        
+                except Exception as e:
+                    logging.error(f"Blueskyログインエラー: {e}")
+                    return False
+                    
+            def api_request(self, endpoint, params=None):
+                """Bluesky APIリクエスト"""
+                if not self.session:
+                    logging.error("セッションが無効です")
+                    return None
+                    
+                headers = {
+                    'Authorization': f'Bearer {self.session}',
+                    'Content-Type': 'application/json'
+                }
+                
+                try:
+                    response = requests.get(
+                        f'{self.base_url}/xrpc/{endpoint}',
+                        params=params,
+                        headers=headers
+                    )
+                    
+                    if response.status_code == 200:
+                        return response.json()
+                    else:
+                        logging.error(f"APIエラー {endpoint}: {response.status_code}")
+                        return None
+                        
+                except Exception as e:
+                    logging.error(f"APIリクエストエラー: {e}")
+                    return None
+                    
+            def fetch_activities(self):
+                """投稿・リポスト・リプライを取得"""
+                if not self.session:
+                    return []
+                    
+                logging.info("Blueskyアクティビティを取得中...")
+                activities = []
+                
+                try:
+                    # 差分取得の基準時刻
+                    if self.state.state['is_first_run'] or FORCE_FULL_SYNC:
+                        cutoff_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                        logging.info("  初回実行または強制フル同期 - 全件取得")
+                    else:
+                        last_time = self.state.state['bluesky'].get('last_execution_time')
+                        if last_time:
+                            cutoff_time = datetime.fromisoformat(last_time)
+                            logging.info(f"  差分取得 - 前回実行時刻: {last_time}")
+                        else:
+                            cutoff_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    
+                    # フィードを取得
+                    cursor = None
+                    page_count = 0
+                    
+                    while True:
+                        page_count += 1
+                        logging.info(f"  ページ {page_count} 取得中...")
+                        
+                        # APIパラメータ
+                        params = {'actor': self.did, 'limit': 50}
+                        if cursor:
+                            params['cursor'] = cursor
+                        
+                        # フィード取得
+                        data = self.api_request('app.bsky.feed.getAuthorFeed', params)
+                        
+                        if not data or 'feed' not in data or not data['feed']:
+                            logging.info(f"  ページ {page_count}: データなし")
+                            break
+                        
+                        # 自分のアクティビティのみフィルタ
+                        for item in data['feed']:
+                            # リポストの場合
+                            if 'reason' in item and item['reason']:
+                                if item['reason'].get('$type') == 'app.bsky.feed.defs#reasonRepost':
+                                    if item['reason']['by']['did'] == self.did:
+                                        try:
+                                            activity_time = parser.parse(item['reason']['indexedAt']).replace(tzinfo=timezone.utc)
+                                            if activity_time > cutoff_time:
+                                                activities.append(item)
+                                        except Exception as e:
+                                            logging.warning(f"リポスト時刻解析エラー: {e}")
+                            
+                            # 投稿・リプライの場合
+                            elif 'post' in item and item['post']['author']['did'] == self.did:
+                                try:
+                                    created_at = item['post']['record'].get('createdAt', item['post'].get('indexedAt'))
+                                    if created_at:
+                                        activity_time = parser.parse(created_at).replace(tzinfo=timezone.utc)
+                                        if activity_time > cutoff_time:
+                                            activities.append(item)
+                                except Exception as e:
+                                    logging.warning(f"投稿時刻解析エラー: {e}")
+                        
+                        # カーソル更新
+                        cursor = data.get('cursor')
+                        if not cursor:
+                            logging.info(f"  ページ {page_count}: 最終ページ")
+                            break
+                            
+                        # レート制限対策
+                        time.sleep(0.8)
+                    
+                    logging.info(f"✅ Blueskyアクティビティ取得完了: {len(activities)}件")
+                    return activities
+                    
+                except Exception as e:
+                    logging.error(f"Blueskyアクティビティ取得エラー: {e}")
+                    logging.error(f"詳細: {type(e).__name__}: {str(e)}")
+                    return []
+                    
+            def fetch_likes(self):
+                """ライクを取得"""
+                if not self.session:
+                    return []
+                    
+                logging.info("Blueskyライクを取得中...")
+                likes = []
+                
+                try:
+                    # 差分取得の基準時刻
+                    if self.state.state['is_first_run'] or FORCE_FULL_SYNC:
+                        cutoff_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                        logging.info("  初回実行または強制フル同期 - 全件取得")
+                    else:
+                        last_time = self.state.state['bluesky'].get('last_execution_time')
+                        if last_time:
+                            cutoff_time = datetime.fromisoformat(last_time)
+                        else:
+                            cutoff_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    
+                    # ライクを取得
+                    cursor = None
+                    page_count = 0
+                    
+                    while True:
+                        page_count += 1
+                        logging.info(f"  ページ {page_count} 取得中...")
+                        
+                        # APIパラメータ
+                        params = {'actor': self.did, 'limit': 25}
+                        if cursor:
+                            params['cursor'] = cursor
+                        
+                        # ライク取得
+                        data = self.api_request('app.bsky.feed.getActorLikes', params)
+                        
+                        if not data or 'feed' not in data or not data['feed']:
+                            logging.info(f"  ページ {page_count}: データなし")
+                            break
+                        
+                        # 元投稿の作成時刻でフィルタ
+                        for item in data['feed']:
+                            try:
+                                created_at = item['post']['record'].get('createdAt', item['post'].get('indexedAt'))
+                                if created_at:
+                                    post_time = parser.parse(created_at).replace(tzinfo=timezone.utc)
+                                    if post_time > cutoff_time:
+                                        likes.append(item)
+                            except Exception as e:
+                                logging.warning(f"ライク時刻解析エラー: {e}")
+                        
+                        # カーソル更新
+                        cursor = data.get('cursor')
+                        if not cursor:
+                            logging.info(f"  ページ {page_count}: 最終ページ")
+                            break
+                            
+                        # レート制限対策
+                        time.sleep(1)
+                    
+                    logging.info(f"✅ Blueskyライク取得完了: {len(likes)}件")
+                    return likes
+                    
+                except Exception as e:
+                    logging.error(f"Blueskyライク取得エラー: {e}")
+                    return []
+                    
+            def process_facets(self, text, facets):
+                """Blueskyのリッチテキストを処理"""
+                if not text or not facets:
+                    return text
+                    
+                # バイトインデックスを文字インデックスに変換する処理
+                # (簡略化のため、ASCIIテキストと仮定)
+                return text
+                
+            def format_entry(self, item, entry_type):
+                """エントリーをThino形式に変換"""
+                if entry_type == 'activity':
+                    # リポストの場合
+                    if 'reason' in item and item['reason']:
+                        if item['reason'].get('$type') == 'app.bsky.feed.defs#reasonRepost':
+                            repost_time = parser.parse(item['reason']['indexedAt']).replace(tzinfo=timezone.utc)
+                            time_jst = repost_time.astimezone(JST)
+                            time_str = time_jst.strftime('%H:%M')
+                            author = item['post']['author'].get('displayName') or item['post']['author']['handle']
+                            content = item['post']['record'].get('text', '')
+                            return {
+                                'entry': f"- {time_str} RP @{author} {content} #via_bluesky",
+                                'date': time_jst.date(),
+                                'time': time_jst
+                            }
+                    
+                    # 通常の投稿・リプライ
+                    created_at = item['post']['record'].get('createdAt', item['post'].get('indexedAt'))
+                    post_time = parser.parse(created_at).replace(tzinfo=timezone.utc)
+                    time_jst = post_time.astimezone(JST)
+                    time_str = time_jst.strftime('%H:%M')
+                    content = item['post']['record'].get('text', '')
+                    
+                    if item['post']['record'].get('reply'):
+                        return {
+                            'entry': f"- {time_str} Re {content} #via_bluesky",
+                            'date': time_jst.date(),
+                            'time': time_jst
+                        }
+                    else:
+                        return {
+                            'entry': f"- {time_str} {content} #via_bluesky",
+                            'date': time_jst.date(),
+                            'time': time_jst
+                        }
+                        
+                elif entry_type == 'like':
+                    # ライクは元投稿の作成時刻を使用
+                    created_at = item['post']['record'].get('createdAt', item['post'].get('indexedAt'))
+                    post_time = parser.parse(created_at).replace(tzinfo=timezone.utc)
+                    time_jst = post_time.astimezone(JST)
+                    time_str = time_jst.strftime('%H:%M')
+                    author = item['post']['author'].get('displayName') or item['post']['author']['handle']
+                    content = item['post']['record'].get('text', '')
+                    return {
+                        'entry': f"- {time_str} ⭐️{author} {content} #via_bluesky_fav",
+                        'date': time_jst.date(),
+                        'time': time_jst
+                    }
+        
+        
+        class DailyNoteManager:
+            """日記ファイル管理"""
+            def __init__(self):
+                self.entries_by_date = {}
+                
+            def add_entries(self, entries):
+                """エントリーを日付別に追加"""
+                for entry in entries:
+                    date_str = entry['date'].strftime('%Y-%m-%d')
+                    if date_str not in self.entries_by_date:
+                        self.entries_by_date[date_str] = []
+                    self.entries_by_date[date_str].append(entry)
+                    
+            def save_all(self):
+                """すべての日記ファイルを保存"""
+                for date_str, entries in self.entries_by_date.items():
+                    self.save_daily_note(date_str, entries)
+                    time.sleep(0.5)  # ファイル操作の間隔
+                    
+            def save_daily_note(self, date_str, new_entries):
+                """日記ファイルを更新"""
+                filename = f"Thino/{date_str}.md"
+                
+                # 既存ファイルを読み込み
+                existing_entries = []
+                if os.path.exists(filename):
+                    try:
+                        with open(filename, 'r', encoding='utf-8') as f:
+                            content = f.read().strip()
+                            if content:
+                                lines = content.split('\n')
+                                # 日付ヘッダー以外の行を抽出
+                                for line in lines:
+                                    if line.startswith('- '):
+                                        existing_entries.append(line)
+                    except Exception as e:
+                        logging.warning(f"既存ファイル読み込みエラー: {e}")
+                
+                # 重複チェック用のセット
+                existing_set = set(existing_entries)
+                
+                # 新規エントリーを追加（重複排除）
+                all_entries = existing_entries.copy()
+                added_count = 0
+                for entry in new_entries:
+                    if entry['entry'] not in existing_set:
+                        all_entries.append(entry['entry'])
+                        existing_set.add(entry['entry'])
+                        added_count += 1
+                
+                if added_count == 0:
+                    logging.info(f"変更なし: {filename}")
+                    return
+                
+                # 時刻でソート
+                def extract_time(entry_line):
+                    match = re.match(r'- (\d{2}:\d{2})', entry_line)
+                    return match.group(1) if match else '00:00'
+                
+                all_entries.sort(key=extract_time)
+                
+                # ファイルに書き込み
+                try:
+                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                    header = f"# {date_obj.strftime('%Y年%m月%d日')}\n\n"
+                    
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(header)
+                        f.write('\n'.join(all_entries))
+                        if all_entries:
+                            f.write('\n')
+                    
+                    logging.info(f"✅ 更新完了: {filename} (新規 {added_count}件, 合計 {len(all_entries)}件)")
+                    
+                except Exception as e:
+                    logging.error(f"ファイル書き込みエラー ({filename}): {e}")
+        
+        
+        def main():
+            """メイン処理"""
+            execution_start_time = datetime.now(JST)
+            logging.info("🚀 統合ソーシャルメディア同期を開始します...")
+            logging.info(f"⏰ 実行開始時刻: {execution_start_time.strftime('%Y-%m-%d %H:%M:%S')} JST")
+            
+            # 状態管理の初期化
+            sync_state = UnifiedSyncState()
+            if FORCE_FULL_SYNC:
+                logging.info("🔄 強制フル同期が指定されました")
+                sync_state.state['is_first_run'] = True
+            
+            # 日記ファイル管理の初期化
+            note_manager = DailyNoteManager()
+            
+            # 統計情報
+            stats = {
+                'mastodon_posts': 0,
+                'mastodon_favs': 0,
+                'mastodon_bookmarks': 0,
+                'bluesky_activities': 0,
+                'bluesky_likes': 0,
+                'total_files': 0
+            }
+            
+            # 1. Mastodon同期
+            if MASTODON_ACCESS_TOKEN and MASTODON_INSTANCE_URL:
+                logging.info("\n=== Mastodon同期 ===")
+                try:
+                    mastodon = MastodonSync(MASTODON_INSTANCE_URL, MASTODON_ACCESS_TOKEN, sync_state)
+                    
+                    # アカウントID取得
+                    account_id = mastodon.get_account_id()
+                    if account_id:
+                        # 投稿取得
+                        posts = mastodon.fetch_posts(account_id)
+                        if posts:
+                            entries = []
+                            for post in posts:
+                                entry = mastodon.format_entry(post, 'post')
+                                entries.append(entry)
+                            note_manager.add_entries(entries)
+                            stats['mastodon_posts'] = len(posts)
+                            
+                            # 最新の投稿IDを保存
+                            if posts:
+                                sync_state.state['mastodon']['last_post_id'] = posts[0]['id']
+                        
+                        # お気に入り取得
+                        favourites = mastodon.fetch_favourites()
+                        if favourites:
+                            entries = []
+                            for fav in favourites:
+                                entry = mastodon.format_entry(fav, 'favourite')
+                                entries.append(entry)
+                            note_manager.add_entries(entries)
+                            stats['mastodon_favs'] = len(favourites)
+                        
+                        # ブックマーク取得
+                        bookmarks = mastodon.fetch_bookmarks()
+                        if bookmarks:
+                            entries = []
+                            for bookmark in bookmarks:
+                                entry = mastodon.format_entry(bookmark, 'bookmark')
+                                entries.append(entry)
+                            note_manager.add_entries(entries)
+                            stats['mastodon_bookmarks'] = len(bookmarks)
+                        
+                        # 実行時刻を保存
+                        sync_state.state['mastodon']['last_execution_time'] = execution_start_time.isoformat()
+                        
+                except Exception as e:
+                    logging.error(f"Mastodon同期エラー: {e}")
+                    logging.info("Mastodon同期をスキップして続行します")
+            else:
+                logging.info("Mastodon設定が見つかりません - スキップ")
+            
+            # 2. Bluesky同期
+            if BLUESKY_HANDLE and BLUESKY_PASSWORD:
+                logging.info("\n=== Bluesky同期 ===")
+                try:
+                    bluesky = BlueskySync(BLUESKY_HANDLE, BLUESKY_PASSWORD, sync_state)
+                    
+                    if bluesky.login():
+                        # アクティビティ取得
+                        activities = bluesky.fetch_activities()
+                        if activities:
+                            entries = []
+                            for activity in activities:
+                                entry = bluesky.format_entry(activity, 'activity')
+                                entries.append(entry)
+                            note_manager.add_entries(entries)
+                            stats['bluesky_activities'] = len(activities)
+                        
+                        # ライク取得
+                        likes = bluesky.fetch_likes()
+                        if likes:
+                            entries = []
+                            for like in likes:
+                                entry = bluesky.format_entry(like, 'like')
+                                entries.append(entry)
+                            note_manager.add_entries(entries)
+                            stats['bluesky_likes'] = len(likes)
+                        
+                        # 実行時刻を保存
+                        sync_state.state['bluesky']['last_execution_time'] = execution_start_time.isoformat()
+                        
+                except Exception as e:
+                    logging.error(f"Bluesky同期エラー: {e}")
+                    logging.info("Bluesky同期をスキップして続行します")
+            else:
+                logging.info("Bluesky設定が見つかりません - スキップ")
+            
+            # 3. 日記ファイルを保存
+            logging.info("\n=== ファイル保存 ===")
+            note_manager.save_all()
+            stats['total_files'] = len(note_manager.entries_by_date)
+            
+            # 4. 状態を保存
+            sync_state.state['is_first_run'] = False
+            sync_state.save()
+            
+            # 5. 完了報告
+            logging.info("\n🎉 統合同期完了！")
+            logging.info("=" * 50)
+            logging.info("📊 処理結果:")
+            logging.info(f"  Mastodon:")
+            logging.info(f"    - 投稿: {stats['mastodon_posts']}件")
+            logging.info(f"    - お気に入り: {stats['mastodon_favs']}件")
+            logging.info(f"    - ブックマーク: {stats['mastodon_bookmarks']}件")
+            logging.info(f"  Bluesky:")
+            logging.info(f"    - アクティビティ: {stats['bluesky_activities']}件")
+            logging.info(f"    - ライク: {stats['bluesky_likes']}件")
+            logging.info(f"  📁 更新ファイル数: {stats['total_files']}個")
+            logging.info(f"⏰ 実行時間: {(datetime.now(JST) - execution_start_time).total_seconds():.1f}秒")
+            logging.info(f"📝 状態ファイル: {UNIFIED_STATE_FILE}")
+            
+        
+        if __name__ == "__main__":
+            main()
+        EOF
+        
+    - name: Commit and push changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add Thino/
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🤖 統合ソーシャルメディア同期: $(TZ='Asia/Tokyo' date +'%Y年%m月%d日 %H:%M JST')"
+          git push
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
